@@ -3,32 +3,36 @@ Algoritmo Genético para determinar la ubicación óptima de una
 Central Nuclear Modular Pequeña (SMR) en la región del corredor
 Río Paraná -> Mar del Plata.
 
-Cambio respecto a la versión anterior:
-  - El cromosoma ya no es un escalar t sobre una polilínea, sino un
-    vector libre v = (lat, lon).
-  - El crossover es aritmético (blend) sobre ambas componentes.
-  - Como al liberar el cromosoma se pierde la restricción implícita
-    de "estar sobre el corredor ribereño" que antes daba la polilínea,
-    se agrega un término explícito f_agua que premia estar cerca del
-    corredor (necesario por la toma de agua de refrigeración de la
-    central). El corredor sigue definido por BOUNDARY_POINTS, pero
-    ahora funciona como el eje de una franja, no como el único lugar
-    válido.
-  - RESTRICCIÓN DE TIERRA/AGUA (dura): f_agua por sí sola no distingue
-    de qué lado de la costa/río está el punto, así que el GA podía
-    converger en pleno Río de la Plata. Se agrega una máscara real de
-    tierra/agua (paquete global-land-mask) y cualquier individuo que
-    caiga en agua recibe fitness = 0 directamente, sin excepción. La
-    población inicial también se genera por rechazo (resampling)
-    hasta caer en tierra, para no arrancar con individuos inválidos.
-  - La mutación gaussiana se hace isotrópica en km (no en grados),
-    porque 1° de longitud no equivale a la misma distancia que 1° de
-    latitud a estas latitudes.
+CAMBIO respecto a la versión anterior (ga_central_nuclear_v2_poblacion.py):
+  - El riesgo poblacional YA NO se calcula con una lista fija de ~30
+    centros poblados (partidos/ciudades con su población del Censo
+    2022), sino con datos de POBLACIÓN GRILLADA REAL: GHS-POP
+    (Global Human Settlement Population Grid, Comisión Europea /
+    JRC), proyección Mollweide (ESRI:54009), resolución 1 km,
+    escenario 2030 (E2030).
+  - Para cada individuo del GA, se calcula la población real que
+    vive dentro de un radio de RADIO_RIESGO_KM alrededor del punto,
+    sumando directamente los píxeles del raster (cada píxel = cantidad
+    de personas estimada en esa celda de 1x1 km). Esto resuelve el
+    problema de fondo de las versiones anteriores: ya no importa si
+    hay "una ciudad" cerca o no, se ve la densidad poblacional real,
+    haya o no un nombre de localidad asociado (loteos, barrios
+    cerrados, zonas rurales densas, etc. quedan reflejados igual).
+  - Los tiles GHS-POP se leen de la carpeta GHS_POP_DIR (ver abajo);
+    hay que colocar ahí TODOS los .tif que cubran el rectángulo de
+    búsqueda. Para este corredor (aprox. lat -28 a -37, lon -55 a
+    -63) hacen falta los tiles: R13_C12, R13_C13, R14_C12, R14_C13
+    (nomenclatura GHS_POP_E2030_GLOBE_R2023A_54009_1000_V1_0_R##_C##.tif).
+  - Se arma un mosaico único (rasterio.merge) al arrancar el script,
+    y las consultas de población por radio son muy rápidas
+    (~0.03 ms cada una), así que no hay problema de performance aun
+    con miles de evaluaciones durante la corrida del GA.
 
 Criterios de fitness (solo se evalúan si el punto está en tierra):
-  1. Costo eléctrico   (cercanía a red de transmisión y a centros de demanda)
-  2. Riesgo sísmico     (cercanía a fallas / zonificación INPRES, proxy simplificado)
-  3. Restricción de distancia a ciudades (óptimo entre 20 y 30 km)
+  1. Costo eléctrico       (cercanía a red de transmisión y a centros de demanda)
+  2. Riesgo sísmico         (cercanía a fallas / zonificación INPRES, proxy simplificado)
+  3. Riesgo poblacional     (población real dentro de un radio, según GHS-POP;
+                             exclusión dura < RADIO_MIN_DURO_KM)
   4. Cercanía al corredor hídrico (toma de agua de refrigeración, ya en tierra)
 
 Salidas:
@@ -42,6 +46,7 @@ import math
 import random
 import json
 import os
+import glob
 from datetime import datetime
 
 import numpy as np
@@ -50,6 +55,11 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import folium
 from global_land_mask import globe
+import rasterio
+from rasterio import Affine
+from rasterio.warp import calculate_default_transform, reproject, Resampling
+from rasterio.merge import merge as rio_merge
+from pyproj import Transformer
 
 
 # ============================================================
@@ -108,6 +118,107 @@ SUBESTACIONES = [
     ("Ezeiza", -34.85, -58.55),
     ("Necochea", -38.55, -58.74),
 ]
+
+# ============================================================
+# RIESGO POBLACIONAL — POBLACIÓN GRILLADA REAL (GHS-POP)
+# ============================================================
+#
+# Carpeta donde deben estar TODOS los .tif de GHS-POP descargados
+# (tiles que cubran el rectángulo de búsqueda). Para este corredor
+# hacen falta: R13_C12, R13_C13, R14_C12, R14_C13.
+GHS_POP_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "ghs_pop_tiles")
+
+RADIO_RIESGO_KM = 15.0       # radio en el que se suma población real alrededor del punto
+RADIO_MIN_DURO_KM = 15.0     # exclusión regulatoria dura (mismo radio en este caso)
+
+_ghs_mosaico = None
+_ghs_transform = None
+_ghs_res_m = None
+_ghs_offsets_mask = None  # (dr, dc) de píxeles dentro del radio, precalculado una sola vez
+_transformer_a_moll = Transformer.from_crs("EPSG:4326", "ESRI:54009", always_xy=True)
+
+
+def _cargar_mosaico_ghs_pop():
+    """Arma un único mosaico en memoria a partir de todos los .tif en GHS_POP_DIR."""
+    global _ghs_mosaico, _ghs_transform, _ghs_res_m, _ghs_offsets_mask
+
+    archivos = sorted(glob.glob(os.path.join(GHS_POP_DIR, "*.tif")))
+    if not archivos:
+        raise FileNotFoundError(
+            f"No se encontraron tiles GHS-POP (.tif) en '{GHS_POP_DIR}'.\n"
+            "Colocá ahí los tiles que cubren el corredor de estudio: "
+            "R13_C12, R13_C13, R14_C12, R14_C13 "
+            "(GHS_POP_E2030_GLOBE_R2023A_54009_1000_V1_0_R##_C##.tif)."
+        )
+
+    datasets = [rasterio.open(f) for f in archivos]
+    mosaico, transform = rio_merge(datasets, nodata=-200)
+    for ds in datasets:
+        ds.close()
+
+    banda = mosaico[0].astype(np.float64)
+    banda[banda < 0] = 0.0  # nodata (-200, típicamente océano/sin dato) -> 0 habitantes
+
+    _ghs_mosaico = banda
+    _ghs_transform = transform
+    _ghs_res_m = abs(transform.a)
+
+    # Máscara circular de offsets (fila, col) relativos al centro, calculada
+    # una sola vez y reutilizada en cada consulta (todas usan el mismo radio).
+    radio_px = int(math.ceil((RADIO_RIESGO_KM * 1000) / _ghs_res_m))
+    dr, dc = np.meshgrid(
+        np.arange(-radio_px, radio_px + 1), np.arange(-radio_px, radio_px + 1), indexing="ij"
+    )
+    dist_m = np.sqrt((dr * _ghs_res_m) ** 2 + (dc * _ghs_res_m) ** 2)
+    dentro = dist_m <= RADIO_RIESGO_KM * 1000
+    _ghs_offsets_mask = (dr[dentro], dc[dentro])
+
+    print(f"[GHS-POP] Mosaico armado a partir de {len(archivos)} tile(s): "
+          f"{[os.path.basename(a) for a in archivos]}")
+    print(f"[GHS-POP] Forma del mosaico: {banda.shape}, resolución: {_ghs_res_m:.1f} m/px, "
+          f"población total en el mosaico: {banda.sum():,.0f}")
+
+
+def _fila_columna(point):
+    lat, lon = point
+    x, y = _transformer_a_moll.transform(lon, lat)
+    return rasterio.transform.rowcol(_ghs_transform, x, y)
+
+
+def poblacion_en_radio(point, radio_km=RADIO_RIESGO_KM):
+    """Suma la población real (GHS-POP) dentro de radio_km del punto."""
+    if _ghs_mosaico is None:
+        _cargar_mosaico_ghs_pop()
+
+    row, col = _fila_columna(point)
+    n_filas, n_cols = _ghs_mosaico.shape
+    if not (0 <= row < n_filas and 0 <= col < n_cols):
+        return 0.0  # punto fuera de la cobertura de los tiles cargados
+
+    dr, dc = _ghs_offsets_mask
+    filas = row + dr
+    cols = col + dc
+    validos = (filas >= 0) & (filas < n_filas) & (cols >= 0) & (cols < n_cols)
+    return float(_ghs_mosaico[filas[validos], cols[validos]].sum())
+
+
+def hay_poblacion_cerca(point, umbral_habitantes_px=1.0, radio_busqueda_km=RADIO_MIN_DURO_KM):
+    """
+    Para la exclusión dura: True si dentro de radio_busqueda_km hay algún
+    píxel con población por encima del umbral (evita colocar la central
+    a metros de un núcleo poblacional, aunque sea chico).
+    """
+    if _ghs_mosaico is None:
+        _cargar_mosaico_ghs_pop()
+    row, col = _fila_columna(point)
+    n_filas, n_cols = _ghs_mosaico.shape
+    if not (0 <= row < n_filas and 0 <= col < n_cols):
+        return False
+    dr, dc = _ghs_offsets_mask
+    filas = row + dr
+    cols = col + dc
+    validos = (filas >= 0) & (filas < n_filas) & (cols >= 0) & (cols < n_cols)
+    return bool((_ghs_mosaico[filas[validos], cols[validos]] >= umbral_habitantes_px).any())
 
 # Margen (en grados) para definir el rectángulo de búsqueda alrededor
 # del corredor. El cromosoma (lat, lon) se genera y se acota dentro
@@ -216,15 +327,7 @@ def normalizar(valores):
     return [(v - vmin) / rango for v in valores]
 
 
-# ============================================================
-# RESTRICCIÓN DE DISTANCIA A CIUDAD (óptimo entre 20 y 30 km)
-# ============================================================
 
-def penalizacion_ciudad(point, d_optimo=25.0, sigma=8.0, d_min_duro=15.0):
-    d = min(haversine(point, (c[1], c[2])) for c in CIUDADES)
-    if d < d_min_duro:
-        return 0.0  # demasiado cerca: descartado
-    return math.exp(-((d - d_optimo) ** 2) / (2 * sigma ** 2))
 
 
 # ============================================================
@@ -253,7 +356,7 @@ PROB_MUTACION = 0.25
 SIGMA_MUTACION_KM = 15.0  # desvío estándar de la mutación, en km
 TAM_TORNEO = 2
 
-PESOS_FITNESS = dict(costo=0.25, sismico=0.25, ciudad=0.25, agua=0.25)
+PESOS_FITNESS = dict(costo=0.25, sismico=0.25, riesgo_poblacional=0.25, agua=0.25)
 
 # Rectángulo de búsqueda: envolvente de BOUNDARY_POINTS + margen
 LAT_MIN = min(p[0] for p in BOUNDARY_POINTS) - MARGEN_BUSQUEDA_DEG
@@ -301,9 +404,14 @@ def evaluar_poblacion(poblacion):
     if puntos_validos:
         costos_brutos_validos = [costo_electrico_bruto(p) for p in puntos_validos]
         vmin, vmax = min(costos_brutos_validos), max(costos_brutos_validos)
+
+        riesgos_brutos_validos = [poblacion_en_radio(p) for p in puntos_validos]
+        rmin, rmax = min(riesgos_brutos_validos), max(riesgos_brutos_validos)
     else:
         vmin, vmax = 0.0, 1.0
+        rmin, rmax = 0.0, 1.0
     rango = (vmax - vmin) if (vmax - vmin) > 1e-9 else 1e-9
+    rango_riesgo = (rmax - rmin) if (rmax - rmin) > 1e-9 else 1e-9
 
     fitness_total = []
     detalle = []
@@ -311,21 +419,32 @@ def evaluar_poblacion(poblacion):
         if not valido:
             fitness_total.append(0.0)
             detalle.append(dict(punto=p, en_tierra=False,
-                                 f_costo=0.0, f_sismico=0.0, f_ciudad=0.0, f_agua=0.0))
+                                 f_costo=0.0, f_sismico=0.0, f_riesgo_poblacional=0.0, f_agua=0.0))
+            continue
+
+        # Exclusión regulatoria dura: no admitir el punto si hay
+        # población real (según GHS-POP) dentro del radio mínimo duro.
+        if hay_poblacion_cerca(p):
+            fitness_total.append(0.0)
+            detalle.append(dict(punto=p, en_tierra=True,
+                                 f_costo=0.0, f_sismico=0.0, f_riesgo_poblacional=0.0, f_agua=0.0))
             continue
 
         c_norm = (costo_electrico_bruto(p) - vmin) / rango
         f_costo = 1 - c_norm
         f_sismico = 1 - riesgo_sismico(p)
-        f_ciudad = penalizacion_ciudad(p)
+
+        r_norm = (poblacion_en_radio(p) - rmin) / rango_riesgo
+        f_riesgo_poblacional = 1 - r_norm  # menos población expuesta = mejor
+
         f_hidrico = f_agua(p)
         f = (PESOS_FITNESS["costo"] * f_costo
              + PESOS_FITNESS["sismico"] * f_sismico
-             + PESOS_FITNESS["ciudad"] * f_ciudad
+             + PESOS_FITNESS["riesgo_poblacional"] * f_riesgo_poblacional
              + PESOS_FITNESS["agua"] * f_hidrico)
         fitness_total.append(f)
         detalle.append(dict(punto=p, en_tierra=True, f_costo=f_costo, f_sismico=f_sismico,
-                             f_ciudad=f_ciudad, f_agua=f_hidrico))
+                             f_riesgo_poblacional=f_riesgo_poblacional, f_agua=f_hidrico))
     return fitness_total, detalle
 
 
@@ -460,6 +579,39 @@ def graficar_convergencia(historia_mejor, historia_promedio, historia_peor, hist
 # MAPA HTML CON EL PUNTO ÓPTIMO
 # ============================================================
 
+def _reproyectar_ghs_a_wgs84(mosaico, transform_moll, downsample_factor=2):
+    src_height, src_width = mosaico.shape
+    src_crs = "ESRI:54009"
+    dst_crs = "EPSG:4326"
+
+    dst_transform, dst_width, dst_height = calculate_default_transform(
+        src_crs, dst_crs, src_width, src_height,
+        *rasterio.transform.array_bounds(src_height, src_width, transform_moll)
+    )
+
+    if downsample_factor > 1:
+        # Escala uniforme en X e Y: cada pixel de salida pasa a cubrir
+        # 'downsample_factor' veces el ancho/alto original.
+        dst_transform = dst_transform * Affine.scale(downsample_factor)
+        dst_width = max(1, dst_width // downsample_factor)
+        dst_height = max(1, dst_height // downsample_factor)
+
+    destino = np.zeros((dst_height, dst_width), dtype=np.float64)
+
+    reproject(
+        source=mosaico,
+        destination=destino,
+        src_transform=transform_moll,
+        src_crs=src_crs,
+        dst_transform=dst_transform,
+        dst_crs=dst_crs,
+        resampling=Resampling.average,
+        src_nodata=0.0,
+        dst_nodata=0.0,
+    )
+
+    return destino, dst_transform
+
 def generar_mapa(mejor, mejor_fitness_total, poblacion_final, path="mapa_optimo.html"):
     punto_optimo = mejor["detalle"]["punto"]
 
@@ -476,8 +628,40 @@ def generar_mapa(mejor, mejor_fitness_total, poblacion_final, path="mapa_optimo.
         folium.CircleMarker(
             location=(lat, lon), radius=5, color="#6a1b9a", fill=True,
             fill_color="#6a1b9a", fill_opacity=0.8,
-            popup=f"Ciudad: {nombre}",
+            popup=f"Ciudad (demanda/costo): {nombre}",
         ).add_to(m)
+
+    # Overlay de densidad poblacional real (GHS-POP) sobre el mapa.
+    # Nota: el mosaico está en Mollweide; para el overlay en Folium
+    # (que trabaja en lat/lon) se usa el rectángulo envolvente en
+    # lat/lon de las cuatro esquinas del mosaico como aproximación —
+    # suficiente para visualización a esta escala regional, aunque
+    # introduce una distorsión geométrica menor.
+    if _ghs_mosaico is not None:
+        # 1. Pasamos el mapa por la función nueva para corregir la proyección
+        img_wgs84, transform_wgs84 = _reproyectar_ghs_a_wgs84(_ghs_mosaico, _ghs_transform)
+
+        # 2. Le damos colorcito
+        img_log = np.log1p(img_wgs84)
+        img_max = img_log.max() if img_log.max() > 0 else 1.0
+        img_norm = np.clip(img_log / img_max, 0, 1)
+        cmap = matplotlib.colormaps["YlOrRd"]
+        rgba = cmap(img_norm)
+        rgba[..., 3] = np.where(img_wgs84 > 0.5, 0.55, 0.0)
+
+        # 3. Calculamos los bordes exactos ya corregidos
+        h, w = img_wgs84.shape
+        oeste, norte = transform_wgs84 * (0, 0)
+        este, sur = transform_wgs84 * (w, h)
+
+        # 4. Lo pegamos en Folium
+        folium.raster_layers.ImageOverlay(
+            image=rgba,
+            bounds=[[sur, oeste], [norte, este]],
+            opacity=0.7,
+            name="Densidad poblacional (GHS-POP, reproyectado a WGS84)",
+        ).add_to(m)
+        folium.LayerControl().add_to(m)
 
     for nombre, lat, lon in SUBESTACIONES:
         folium.Marker(
@@ -500,7 +684,7 @@ def generar_mapa(mejor, mejor_fitness_total, poblacion_final, path="mapa_optimo.
         f"Lat: {punto_optimo[0]:.4f}, Lon: {punto_optimo[1]:.4f}<br>"
         f"Fitness costo eléctrico: {detalle['f_costo']:.3f}<br>"
         f"Fitness riesgo sísmico: {detalle['f_sismico']:.3f}<br>"
-        f"Fitness distancia a ciudad: {detalle['f_ciudad']:.3f}<br>"
+        f"Fitness riesgo poblacional: {detalle['f_riesgo_poblacional']:.3f}<br>"
         f"Fitness cercanía al corredor hídrico: {detalle['f_agua']:.3f}<br>"
         f"<b>Fitness total: {mejor_fitness_total:.3f}</b>"
     )
@@ -532,7 +716,7 @@ if __name__ == "__main__":
     print(f"Punto óptimo (lat, lon):        {mejor['detalle']['punto']}")
     print(f"Fitness costo eléctrico:        {mejor['detalle']['f_costo']:.3f}")
     print(f"Fitness riesgo sísmico:         {mejor['detalle']['f_sismico']:.3f}")
-    print(f"Fitness distancia ciudad:       {mejor['detalle']['f_ciudad']:.3f}")
+    print(f"Fitness riesgo poblacional:     {mejor['detalle']['f_riesgo_poblacional']:.3f}")
     print(f"Fitness cercanía corredor agua: {mejor['detalle']['f_agua']:.3f}")
     print(f"Fitness total:                  {mejor_fitness_total:.3f}")
 
@@ -553,7 +737,7 @@ if __name__ == "__main__":
             "punto": mejor["detalle"]["punto"],
             "fitness_costo": mejor["detalle"]["f_costo"],
             "fitness_sismico": mejor["detalle"]["f_sismico"],
-            "fitness_ciudad": mejor["detalle"]["f_ciudad"],
+            "fitness_riesgo_poblacional": mejor["detalle"]["f_riesgo_poblacional"],
             "fitness_agua": mejor["detalle"]["f_agua"],
             "fitness_total": mejor_fitness_total,
         }, f, ensure_ascii=False, indent=2)
@@ -562,12 +746,12 @@ if __name__ == "__main__":
     existe_log = os.path.exists(path_log)
     with open(path_log, "a", encoding="utf-8") as f:
         if not existe_log:
-            f.write("timestamp,lat,lon,fitness_costo,fitness_sismico,fitness_ciudad,fitness_agua,"
+            f.write("timestamp,lat,lon,fitness_costo,fitness_sismico,fitness_riesgo_poblacional,fitness_agua,"
                     "fitness_mejor,fitness_promedio,fitness_peor,fitness_std\n")
         lat, lon = mejor["detalle"]["punto"]
         f.write(f"{timestamp},{lat:.6f},{lon:.6f},"
                 f"{mejor['detalle']['f_costo']:.4f},{mejor['detalle']['f_sismico']:.4f},"
-                f"{mejor['detalle']['f_ciudad']:.4f},{mejor['detalle']['f_agua']:.4f},"
+                f"{mejor['detalle']['f_riesgo_poblacional']:.4f},{mejor['detalle']['f_agua']:.4f},"
                 f"{mejor_fitness_total:.4f},"
                 f"{historia_promedio[-1]:.4f},{historia_peor[-1]:.4f},{historia_std[-1]:.4f}\n")
 

@@ -1,0 +1,12 @@
+{
+  "timestamp": "20260818_015503",
+  "punto": [
+    -33.08485536739566,
+    -60.01426682036404
+  ],
+  "fitness_costo": 0.8262682833125813,
+  "fitness_sismico": 0.6094986103092834,
+  "fitness_riesgo_poblacional": 1.0,
+  "fitness_agua": 0.7112903083189767,
+  "fitness_total": 0.0
+}
